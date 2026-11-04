@@ -14,6 +14,7 @@ History note:
 - Initialize singleton static members and dispatch their calls through class scope, including trailing-lambda calls.
 - Update the language reference and OOP guide with constructor naming rules and typed static factory examples.
 - Fix read-only variable error when a catch variable is bound again inside a loop.
+- Fix stale primitive reads after a variable is retyped inside an `if`, `when`, or loop body that may not run; the bytecode compiler now joins slot types at the branch join.
 
 ## 1.5.6 (2026-05-16)
 

@@ -2036,15 +2036,17 @@ class BytecodeCompiler(
 
     private fun collectLoopRealWidenSlots(stmt: Statement): Set<Int> {
         val widened = linkedSetOf<Int>()
-
-        fun noteAssignment(target: ObjRef, value: ObjRef) {
-            val slot = resolveAssignableSlot(target) ?: return
-            if (numericKindFromSlot(slot) != NumericKind.INT) return
+        forEachAssignment(stmt) { target, value ->
+            val slot = resolveAssignableSlot(target) ?: return@forEachAssignment
+            if (numericKindFromSlot(slot) != NumericKind.INT) return@forEachAssignment
             if (inferNumericKind(value) == NumericKind.REAL) {
                 widened.add(slot)
             }
         }
+        return widened
+    }
 
+    private fun forEachAssignment(stmt: Statement, noteAssignment: (target: ObjRef, value: ObjRef) -> Unit) {
         lateinit var scanStatement: (Statement) -> Unit
         lateinit var scanRef: (ObjRef) -> Unit
 
@@ -2161,7 +2163,6 @@ class BytecodeCompiler(
         }
 
         scanStatement(stmt)
-        return widened
     }
 
     private fun rememberSlotTypes(slots: Set<Int>): Map<Int, SlotType?> {
@@ -2186,6 +2187,99 @@ class BytecodeCompiler(
             } else {
                 updateSlotType(slot, type)
             }
+        }
+    }
+
+    private data class SlotFacts(val type: SlotType?, val cls: ObjClass?, val elementCls: ObjClass?)
+
+    private fun snapshotSlotFacts(): Map<Int, SlotFacts> {
+        val result = HashMap<Int, SlotFacts>()
+        for (slot in slotTypes.keys + slotObjClass.keys + listElementClassBySlot.keys) {
+            result[slot] = SlotFacts(slotTypes[slot], slotObjClass[slot], listElementClassBySlot[slot])
+        }
+        return result
+    }
+
+    private fun restoreSlotFacts(facts: Map<Int, SlotFacts>) {
+        val slots = (slotTypes.keys + slotObjClass.keys + listElementClassBySlot.keys + facts.keys).toList()
+        for (slot in slots) {
+            val f = facts[slot]
+            updateSlotType(slot, f?.type ?: SlotType.UNKNOWN)
+            val cls = f?.cls
+            if (cls != null) slotObjClass[slot] = cls else slotObjClass.remove(slot)
+            val elementCls = f?.elementCls
+            if (elementCls != null) listElementClassBySlot[slot] = elementCls else listElementClassBySlot.remove(slot)
+        }
+    }
+
+    // A path that may not have run (a branch, a loop body) leaves a slot it retyped known only
+    // by the frame's runtime tag. Reads of an OBJ slot honour that tag; reads of a primitive
+    // slot read its register directly, so the joined type is OBJ and the class is forgotten.
+    private fun joinSlotFacts(other: Map<Int, SlotFacts>) {
+        val current = snapshotSlotFacts()
+        for (slot in (current.keys + other.keys)) {
+            val a = current[slot]
+            val b = other[slot]
+            if (a == b) continue
+            if (a?.type != b?.type) updateSlotType(slot, SlotType.OBJ)
+            if (a?.cls != b?.cls || a?.elementCls != b?.elementCls) forgetSlotClass(slot)
+        }
+    }
+
+    private fun forgetSlotClass(slot: Int) {
+        slotObjClass.remove(slot)
+        stableObjSlots.remove(slot)
+        listElementClassBySlot.remove(slot)
+        exactCallableObjBySlot.remove(slot)
+        exactLambdaRefBySlot.remove(slot)
+        slotNameFor(slot)?.let { name ->
+            if (nameObjClass[name] != ObjClassType) nameObjClass.remove(name)
+        }
+    }
+
+    private fun slotNameFor(slot: Int): String? {
+        if (slot >= scopeSlotCount) return localSlotNames.getOrNull(slot - scopeSlotCount)
+        for ((key, index) in scopeSlotMap) {
+            if (index == slot) return scopeSlotNameMap[key]
+        }
+        return null
+    }
+
+    private fun inferValueSlotType(ref: ObjRef): SlotType? {
+        if (ref is ConstRef) {
+            return when (ref.constValue) {
+                is ObjInt -> SlotType.INT
+                is ObjReal -> SlotType.REAL
+                is ObjBool -> SlotType.BOOL
+                else -> null
+            }
+        }
+        return when (inferNumericKind(ref)) {
+            NumericKind.INT -> SlotType.INT
+            NumericKind.REAL -> SlotType.REAL
+            else -> null
+        }
+    }
+
+    // A body compiled for the first iteration reads a primitive slot's register directly, so a
+    // slot the body may store another kind into is boxed before the loop and read as OBJ.
+    private fun collectLoopObjWidenSlots(stmt: Statement, exclude: Set<Int>): Set<Int> {
+        val widened = linkedSetOf<Int>()
+        forEachAssignment(stmt) { target, value ->
+            val slot = resolveAssignableSlot(target) ?: return@forEachAssignment
+            if (slot in exclude || slot in widened) return@forEachAssignment
+            val slotType = slotTypes[slot] ?: return@forEachAssignment
+            if (slotType == SlotType.OBJ || slotType == SlotType.UNKNOWN) return@forEachAssignment
+            if (inferValueSlotType(value) != slotType) widened.add(slot)
+        }
+        return widened
+    }
+
+    private fun emitLoopObjWidening(slots: Set<Int>) {
+        for (slot in slots) {
+            if (slot >= scopeSlotCount) builder.emit(Opcode.BOX_OBJ, slot, slot)
+            updateSlotType(slot, SlotType.OBJ)
+            forgetSlotClass(slot)
         }
     }
 
@@ -4581,7 +4675,10 @@ class BytecodeCompiler(
             updateSlotType(resultSlot, SlotType.OBJ)
         }
         val endLabel = builder.label()
+        val entryFacts = snapshotSlotFacts()
+        val caseEndFacts = ArrayList<Map<Int, SlotFacts>>()
         for (case in stmt.cases) {
+            restoreSlotFacts(entryFacts)
             val caseLabel = builder.label()
             val nextCaseLabel = builder.label()
             for (cond in case.conditions) {
@@ -4601,9 +4698,11 @@ class BytecodeCompiler(
                 emitMove(bodyObj, resultSlot)
             }
             restoreFlowTypeOverride(caseRestore)
+            caseEndFacts.add(snapshotSlotFacts())
             builder.emit(Opcode.JMP, listOf(CmdBuilder.Operand.LabelRef(endLabel)))
             builder.mark(nextCaseLabel)
         }
+        restoreSlotFacts(entryFacts)
         stmt.elseCase?.let {
             val elseValue = compileStatementValueOrFallback(it, wantResult) ?: return null
             if (wantResult) {
@@ -4611,6 +4710,7 @@ class BytecodeCompiler(
                 emitMove(elseObj, resultSlot)
             }
         }
+        for (facts in caseEndFacts) joinSlotFacts(facts)
         builder.mark(endLabel)
         return if (wantResult) {
             updateSlotType(resultSlot, SlotType.OBJ)
@@ -6234,8 +6334,11 @@ class BytecodeCompiler(
                 listOf(CmdBuilder.Operand.IntVal(condValue.slot), CmdBuilder.Operand.LabelRef(elseLabel))
             )
         }
+        val entryFacts = snapshotSlotFacts()
         val thenValue = compileStatementValueOrFallback(stmt.ifBody) ?: return null
         emitMove(thenValue, resultSlot)
+        val thenFacts = snapshotSlotFacts()
+        restoreSlotFacts(entryFacts)
         builder.emit(Opcode.JMP, listOf(CmdBuilder.Operand.LabelRef(endLabel)))
 
         builder.mark(elseLabel)
@@ -6246,6 +6349,7 @@ class BytecodeCompiler(
             val id = builder.addConst(BytecodeConst.ObjRef(ObjVoid))
             builder.emit(Opcode.CONST_OBJ, id, resultSlot)
         }
+        joinSlotFacts(thenFacts)
 
         builder.mark(endLabel)
         builder.emit(Opcode.RET, resultSlot)
@@ -7426,6 +7530,7 @@ class BytecodeCompiler(
         if (hasRealWiden) {
             applySlotTypes(realWidenSlots, SlotType.REAL)
         }
+        emitLoopObjWidening(collectLoopObjWidenSlots(stmt.body, realWidenSlots))
         val breakFlagSlot = allocSlot()
         if (range == null && rangeRef == null && typedRangeLocal == null) {
             val sourceValue = compileStatementValueOrFallback(stmt.source) ?: return null
@@ -7529,7 +7634,9 @@ class BytecodeCompiler(
                         hasIterator = false
                     )
                 )
+                val bodyEntryFacts = snapshotSlotFacts()
                 val bodyValue = compileLoopBody(stmt.body, wantResult) ?: return null
+                joinSlotFacts(bodyEntryFacts)
                 if (hasRealWiden) {
                     applySlotTypes(realWidenSlots, SlotType.UNKNOWN)
                 }
@@ -7605,7 +7712,9 @@ class BytecodeCompiler(
                 hasIterator = false
             )
         )
+        val bodyEntryFacts = snapshotSlotFacts()
         val bodyValue = compileLoopBody(stmt.body, wantResult) ?: return null
+        joinSlotFacts(bodyEntryFacts)
         if (hasRealWiden) {
             applySlotTypes(realWidenSlots, SlotType.UNKNOWN)
         }
@@ -7661,6 +7770,7 @@ class BytecodeCompiler(
         if (hasRealWiden) {
             applySlotTypes(realWidenSlots, SlotType.REAL)
         }
+        emitLoopObjWidening(collectLoopObjWidenSlots(stmt.body, realWidenSlots))
 
         val loopLabel = builder.label()
         val continueLabel = builder.label()
@@ -7677,7 +7787,9 @@ class BytecodeCompiler(
                 hasIterator = false
             )
         )
+        val bodyEntryFacts = snapshotSlotFacts()
         val bodyValue = compileLoopBody(stmt.body, wantResult) ?: return null
+        joinSlotFacts(bodyEntryFacts)
         if (hasRealWiden) {
             applySlotTypes(realWidenSlots, SlotType.UNKNOWN)
         }
@@ -7732,6 +7844,7 @@ class BytecodeCompiler(
         if (hasRealWiden) {
             applySlotTypes(realWidenSlots, SlotType.REAL)
         }
+        emitLoopObjWidening(collectLoopObjWidenSlots(stmt.body, realWidenSlots))
 
         val loopLabel = builder.label()
         val continueLabel = builder.label()
@@ -7751,7 +7864,9 @@ class BytecodeCompiler(
                 hasIterator = false
             )
         )
+        val bodyEntryFacts = snapshotSlotFacts()
         val bodyValue = compileStatementValueOrFallback(stmt.body, wantResult) ?: return null
+        joinSlotFacts(bodyEntryFacts)
         loopStack.removeLast()
         if (wantResult) {
             val bodyObj = ensureObjSlot(bodyValue)
@@ -7799,9 +7914,12 @@ class BytecodeCompiler(
                 listOf(CmdBuilder.Operand.IntVal(condition.slot), CmdBuilder.Operand.LabelRef(elseLabel))
             )
         }
+        val entryFacts = snapshotSlotFacts()
         val thenRestore = applyFlowTypeOverride(flowTypeOverrideForIf(stmt.condition, applyForThen = true))
         compileStatementValueOrFallback(stmt.ifBody, false) ?: return null
         restoreFlowTypeOverride(thenRestore)
+        val thenFacts = snapshotSlotFacts()
+        restoreSlotFacts(entryFacts)
         builder.emit(Opcode.JMP, listOf(CmdBuilder.Operand.LabelRef(endLabel)))
         builder.mark(elseLabel)
         stmt.elseBody?.let {
@@ -7809,6 +7927,7 @@ class BytecodeCompiler(
             compileStatementValueOrFallback(it, false) ?: return null
             restoreFlowTypeOverride(elseRestore)
         }
+        joinSlotFacts(thenFacts)
         builder.mark(endLabel)
         return CompiledValue(ensureVoidSlot(), SlotType.OBJ)
     }
@@ -7840,11 +7959,14 @@ class BytecodeCompiler(
                 listOf(CmdBuilder.Operand.IntVal(condition.slot), CmdBuilder.Operand.LabelRef(elseLabel))
             )
         }
+        val entryFacts = snapshotSlotFacts()
         val thenRestore = applyFlowTypeOverride(flowTypeOverrideForIf(stmt.condition, applyForThen = true))
         val thenValue = compileStatementValueOrFallback(stmt.ifBody) ?: return null
         restoreFlowTypeOverride(thenRestore)
         val thenObj = ensureObjSlot(thenValue)
         emitMove(thenObj, resultSlot)
+        val thenFacts = snapshotSlotFacts()
+        restoreSlotFacts(entryFacts)
         builder.emit(Opcode.JMP, listOf(CmdBuilder.Operand.LabelRef(endLabel)))
         builder.mark(elseLabel)
         if (stmt.elseBody != null) {
@@ -7857,6 +7979,7 @@ class BytecodeCompiler(
             val id = builder.addConst(BytecodeConst.ObjRef(ObjVoid))
             builder.emit(Opcode.CONST_OBJ, id, resultSlot)
         }
+        joinSlotFacts(thenFacts)
         builder.mark(endLabel)
         updateSlotType(resultSlot, SlotType.OBJ)
         return CompiledValue(resultSlot, SlotType.OBJ)
@@ -10289,7 +10412,9 @@ class BytecodeCompiler(
                 hasIterator = true
             )
         )
+        val bodyEntryFacts = snapshotSlotFacts()
         val bodyValue = compileLoopBody(stmt.body, wantResult) ?: return null
+        joinSlotFacts(bodyEntryFacts)
         if (hasRealWiden) {
             applySlotTypes(realWidenSlots, SlotType.UNKNOWN)
         }
